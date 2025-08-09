@@ -16,8 +16,11 @@ from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
 )
-from homeassistant.const import CURRENCY_EURO
+from homeassistant.const import CURRENCY_EURO, UnitOfEnergy
 from homeassistant.util import dt
+from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
+from homeassistant.components.recorder.statistics import async_add_external_statistics
 
 from . import DOMAIN
 from .auth import get_access_token
@@ -38,6 +41,7 @@ class PowerPriceData:
         self.lowest_price_time = None
         self.highest_price_time = None
         self.local_tz = local_tz
+        self.consumption_data = None  # Store consumption data
 
     def add_entry(self, timestamp: datetime, price: float) -> None:
         """Add a price entry and update statistics."""
@@ -105,6 +109,7 @@ async def async_setup_entry(
         OstromNextPriceSensor(coordinator, entry),
         OstromLowestPriceTimeSensor(coordinator, entry),
         OstromHighestPriceTimeSensor(coordinator, entry),
+        OstromConsumptionSensor(coordinator, entry),
     ]
     
     # Add entities before the first refresh
@@ -137,6 +142,7 @@ class OstromDataCoordinator(DataUpdateCoordinator):
         self._token_expiration = None
         self._env_prefix = "sandbox.ostrom-api.io" if self.environment == "sandbox" else "production.ostrom-api.io"
         self.local_tz = ZoneInfo(hass.config.time_zone)
+        self.contract_id = entry.data.get("contract_id")  # Store contract ID for consumption API
         
         # Add device info
         self.device_info = DeviceInfo(
@@ -161,6 +167,34 @@ class OstromDataCoordinator(DataUpdateCoordinator):
 
             raw_data = await self._fetch_prices()
             processed_data = self._process_price_data(raw_data)
+            
+            # Fetch consumption data - get contract_id if not available
+            if not self.contract_id:
+                try:
+                    _LOGGER.info("No contract ID found, attempting to fetch from API")
+                    self.contract_id = await self._fetch_contracts()
+                    if self.contract_id:
+                        _LOGGER.info("Found electricity contract ID: %s", self.contract_id)
+                    else:
+                        _LOGGER.warning("No active electricity contract found")
+                except Exception as err:
+                    _LOGGER.warning("Failed to fetch contract ID: %s", err)
+            
+            if self.contract_id:
+                try:
+                    consumption_data = await self._fetch_consumption()
+                    processed_data.consumption_data = consumption_data
+                    
+                    # Process historical consumption data
+                    if consumption_data:
+                        await self._process_historical_consumption(consumption_data)
+                        
+                except Exception as err:
+                    _LOGGER.warning("Failed to fetch consumption data: %s", err)
+                    processed_data.consumption_data = None
+            else:
+                processed_data.consumption_data = None
+            
             _LOGGER.debug("Successfully updated Ostrom price data")
             return processed_data
         except Exception as err:
@@ -204,7 +238,7 @@ class OstromDataCoordinator(DataUpdateCoordinator):
 
     async def _fetch_prices(self):
         """Fetch price data including future prices."""
-        now = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+        now = datetime.now(ZoneInfo("UTC")).replace(minute=0, second=0, microsecond=0)
         url = f"https://{self._env_prefix}/spot-prices"
         
         headers = {"Authorization": f"Bearer {self._access_token}"}
@@ -220,6 +254,114 @@ class OstromDataCoordinator(DataUpdateCoordinator):
                 response.raise_for_status()
                 data = await response.json()
                 return data["data"]
+
+    async def _fetch_contracts(self):
+        """Fetch available contracts and get the first electricity contract ID."""
+        url = f"https://{self._env_prefix}/contracts"
+        headers = {"Authorization": f"Bearer {self._access_token}"}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as response:
+                response.raise_for_status()
+                data = await response.json()
+                
+                # Find the first active electricity contract
+                for contract in data.get("data", []):
+                    if (contract.get("type") == "ELECTRICITY" and 
+                        contract.get("status") == "ACTIVE"):
+                        return contract.get("id")
+                
+                return None
+
+    async def _fetch_consumption(self):
+        """Fetch energy consumption data for the previous day."""
+        if not self.contract_id:
+            _LOGGER.warning("No contract ID available for consumption data")
+            return None
+            
+        # Get previous day's date range in UTC (full 24 hours)
+        now = datetime.now(ZoneInfo("UTC"))
+        yesterday = now - timedelta(days=1)
+        start_date = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
+        # End date should be start of next day to ensure we get all 24 hours
+        end_date = start_date + timedelta(days=1)
+        
+        url = f"https://{self._env_prefix}/contracts/{self.contract_id}/energy-consumption"
+        headers = {"Authorization": f"Bearer {self._access_token}"}
+        params = {
+            "startDate": start_date.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "endDate": end_date.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "resolution": "HOUR"
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, params=params) as response:
+                response.raise_for_status()
+                data = await response.json()
+                return data
+
+    async def _process_historical_consumption(self, consumption_data):
+        """Process historical consumption data and add to recorder statistics."""
+        if not isinstance(consumption_data, dict) or "data" not in consumption_data:
+            return
+            
+        hourly_data = consumption_data["data"]
+        if not isinstance(hourly_data, list) or len(hourly_data) == 0:
+            return
+            
+        # Create statistics for the consumption sensor
+        statistic_id = f"{DOMAIN}:ostrom_consumption_{self.zip_code}"
+        
+        # Prepare statistics data
+        statistics = []
+        running_total = 0
+        
+        for entry in hourly_data:
+            if not isinstance(entry, dict) or "date" not in entry or "kWh" not in entry:
+                continue
+                
+            try:
+                # Parse timestamp
+                date_str = entry["date"]
+                if date_str.endswith('Z'):
+                    date_str = date_str[:-1] + '+00:00'
+                timestamp = datetime.fromisoformat(date_str)
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=ZoneInfo("UTC"))
+                
+                # Convert to local time for statistics
+                local_time = timestamp.astimezone(self.local_tz)
+                
+                # Add to running total
+                kwh = entry["kWh"]
+                running_total += kwh
+                
+                # Create statistic data point
+                statistics.append(StatisticData(
+                    start=local_time,
+                    state=running_total,
+                    sum=running_total
+                ))
+                
+            except Exception as e:
+                _LOGGER.warning("Error processing consumption entry: %s", e)
+                
+        if statistics:
+            # Add statistics to recorder
+            metadata = StatisticMetaData(
+                has_mean=False,
+                has_sum=True,
+                name="Ostrom Energy Consumption",
+                source=DOMAIN,
+                statistic_id=statistic_id,
+                unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+            )
+            
+            try:
+                async_add_external_statistics(self.hass, metadata, statistics)
+                _LOGGER.debug("Added %d historical consumption statistics", len(statistics))
+            except Exception as e:
+                _LOGGER.error("Failed to add historical statistics: %s", e)
 
 class OstromForecastSensor(CoordinatorEntity, SensorEntity):
     """Sensor for price forecasting."""
@@ -467,3 +609,119 @@ class OstromHighestPriceTimeSensor(CoordinatorEntity, SensorEntity):
             "is_today": local_time.date() == datetime.now(self.coordinator.local_tz).date(),
             "is_tomorrow": local_time.date() == (datetime.now(self.coordinator.local_tz) + timedelta(days=1)).date()
         }
+
+class OstromConsumptionSensor(CoordinatorEntity, SensorEntity):
+    """Sensor for current energy consumption."""
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator)
+        self._attr_has_entity_name = True
+        self._attr_translation_key = "ostrom_integration_energy_consumption"
+        self._attr_unique_id = f"ostrom_consumption_{entry.data['zip_code']}"
+        self._attr_state_class = SensorStateClass.TOTAL
+        self._attr_device_class = SensorDeviceClass.ENERGY
+        self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+        self._attr_suggested_display_precision = 2
+        self._attr_device_info = coordinator.device_info
+        self._attr_last_reset = None  # Will be set when data is available
+
+    @property
+    def native_value(self) -> Optional[float]:
+        """Return the running total consumption value."""
+        if not self.coordinator.data or not self.coordinator.data.consumption_data:
+            return None
+        
+        consumption_data = self.coordinator.data.consumption_data
+        if isinstance(consumption_data, dict) and "data" in consumption_data:
+            # Calculate running total of consumption from hourly data
+            hourly_data = consumption_data["data"]
+            if isinstance(hourly_data, list) and len(hourly_data) > 0:
+                running_total = sum(entry.get("kWh", 0) for entry in hourly_data if isinstance(entry, dict))
+                return round(running_total, 3)
+        
+        return None
+
+    @property 
+    def last_reset(self) -> Optional[datetime]:
+        """Return the last reset time for this sensor."""
+        if not self.coordinator.data or not self.coordinator.data.consumption_data:
+            return None
+            
+        consumption_data = self.coordinator.data.consumption_data
+        if isinstance(consumption_data, dict) and "data" in consumption_data:
+            hourly_data = consumption_data["data"]
+            if isinstance(hourly_data, list) and len(hourly_data) > 0:
+                # Use the first hour as the reset time
+                first_entry = hourly_data[0]
+                if isinstance(first_entry, dict) and "date" in first_entry:
+                    try:
+                        date_str = first_entry["date"]
+                        if date_str.endswith('Z'):
+                            date_str = date_str[:-1] + '+00:00'
+                        timestamp = datetime.fromisoformat(date_str)
+                        if timestamp.tzinfo is None:
+                            timestamp = timestamp.replace(tzinfo=ZoneInfo("UTC"))
+                        return timestamp.astimezone(self.coordinator.local_tz)
+                    except Exception:
+                        pass
+        return None
+
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        """Return additional state attributes."""
+        if not self.coordinator.data or not self.coordinator.data.consumption_data:
+            return {}
+
+        consumption_data = self.coordinator.data.consumption_data
+        if isinstance(consumption_data, dict) and "data" in consumption_data:
+            hourly_data = consumption_data["data"]
+            if isinstance(hourly_data, list) and len(hourly_data) > 0:
+                # Create hourly consumption breakdown
+                hourly_consumption = {}
+                total_hours = len(hourly_data)
+                min_consumption = float('inf')
+                max_consumption = 0
+                
+                for entry in hourly_data:
+                    if isinstance(entry, dict) and "date" in entry and "kWh" in entry:
+                        # Parse date and convert to local time
+                        try:
+                            date_str = entry["date"]
+                            if date_str.endswith('Z'):
+                                date_str = date_str[:-1] + '+00:00'
+                            timestamp = datetime.fromisoformat(date_str)
+                            if timestamp.tzinfo is None:
+                                timestamp = timestamp.replace(tzinfo=ZoneInfo("UTC"))
+                            local_time = timestamp.astimezone(self.coordinator.local_tz)
+                            
+                            kwh = entry["kWh"]
+                            hourly_consumption[local_time.strftime("%H:%M")] = kwh
+                            
+                            if kwh < min_consumption:
+                                min_consumption = kwh
+                            if kwh > max_consumption:
+                                max_consumption = kwh
+                        except Exception as e:
+                            _LOGGER.warning("Error parsing consumption entry: %s", e)
+                
+                attributes = {
+                    "hourly_consumption": hourly_consumption,
+                    "total_hours": total_hours,
+                    "min_hourly_consumption": min_consumption if min_consumption != float('inf') else None,
+                    "max_hourly_consumption": max_consumption if max_consumption > 0 else None,
+                    "average_hourly_consumption": round(self.native_value / total_hours, 3) if self.native_value and total_hours > 0 else None,
+                    "data_date": hourly_data[0].get("date", "").split("T")[0] if hourly_data else None
+                }
+                
+                return attributes
+        
+        return {}
+
+    @property
+    def available(self) -> bool:
+        """Return True if entity is available."""
+        return (
+            self.coordinator.last_update_success 
+            and self.coordinator.data is not None
+            and hasattr(self.coordinator, 'contract_id')
+            and self.coordinator.contract_id is not None
+        )
