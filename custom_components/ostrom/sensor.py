@@ -373,7 +373,7 @@ class OstromDataCoordinator(DataUpdateCoordinator):
                 _LOGGER.error("Failed to add hourly statistics: %s", e)
 
     async def _fetch_historical_data_if_needed(self):
-        """Check if historical data exists and fetch missing data iteratively."""
+        """Check if historical data exists and fetch missing data walking backwards from yesterday."""
         if not self.contract_id:
             return
             
@@ -388,45 +388,67 @@ class OstromDataCoordinator(DataUpdateCoordinator):
                 get_last_statistics, self.hass, 1, statistic_id, True, set()
             )
             
-            # Determine the starting date for fetching historical data
-            if last_stats and statistic_id in last_stats:
-                # We have some data, start from the day after the last recorded data
-                last_stat = last_stats[statistic_id][0]
-                last_date = last_stat["start"]
-                start_fetch_date = last_date + timedelta(days=1)
-                _LOGGER.info("Found existing data until %s, starting fetch from %s", last_date, start_fetch_date)
-            else:
-                # No existing data, start from 30 days ago (or when service started)
-                start_fetch_date = datetime.now(ZoneInfo("UTC")) - timedelta(days=30)
-                _LOGGER.info("No existing consumption data found, starting historical fetch from %s", start_fetch_date)
-            
-            # Fetch data day by day until yesterday
+            # Yesterday is our reference point (never fetch today due to API delay)
             yesterday = datetime.now(ZoneInfo("UTC")) - timedelta(days=1)
-            current_date = start_fetch_date.replace(hour=0, minute=0, second=0, microsecond=0)
             yesterday = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
             
             days_fetched = 0
-            max_days_per_run = 7  # Limit to avoid blocking for too long
+            max_days_per_run = 5  # Fetch 5 days per run
             
-            while current_date <= yesterday and days_fetched < max_days_per_run:
-                try:
-                    _LOGGER.debug("Fetching historical consumption data for %s", current_date.date())
-                    consumption_data = await self._fetch_consumption(current_date)
-                    
-                    if consumption_data:
-                        await self._process_historical_consumption(consumption_data)
-                        days_fetched += 1
-                    else:
-                        _LOGGER.debug("No consumption data available for %s", current_date.date())
+            if last_stats and statistic_id in last_stats:
+                # We have existing data - check if we have yesterday's data
+                last_stat = last_stats[statistic_id][0]
+                last_date = last_stat["start"].replace(hour=0, minute=0, second=0, microsecond=0)
+                last_date_utc = last_date.astimezone(ZoneInfo("UTC")).replace(hour=0, minute=0, second=0, microsecond=0)
+                
+                _LOGGER.info("Found existing data until %s", last_date_utc.date())
+                
+                # Walk backwards from yesterday until we find existing data
+                current_date = yesterday
+                while current_date > last_date_utc and days_fetched < max_days_per_run:
+                    try:
+                        _LOGGER.debug("Fetching missing consumption data for %s", current_date.date())
+                        consumption_data = await self._fetch_consumption(current_date)
                         
-                except Exception as e:
-                    _LOGGER.warning("Failed to fetch consumption data for %s: %s", current_date.date(), e)
+                        if consumption_data:
+                            await self._process_historical_consumption(consumption_data)
+                            days_fetched += 1
+                        else:
+                            _LOGGER.debug("No consumption data available for %s", current_date.date())
+                            
+                    except Exception as e:
+                        _LOGGER.warning("Failed to fetch consumption data for %s: %s", current_date.date(), e)
+                    
+                    current_date -= timedelta(days=1)
+                    
+                    # Add small delay to avoid overwhelming the API
+                    if days_fetched > 0:
+                        await asyncio.sleep(0.5)
+                        
+            else:
+                # No existing data - start from yesterday and go backwards for 5 days
+                _LOGGER.info("No existing consumption data found, fetching last 5 days from yesterday")
                 
-                current_date += timedelta(days=1)
-                
-                # Add small delay to avoid overwhelming the API
-                if days_fetched > 0:
-                    await asyncio.sleep(0.5)
+                current_date = yesterday
+                for i in range(max_days_per_run):
+                    try:
+                        _LOGGER.debug("Fetching historical consumption data for %s", current_date.date())
+                        consumption_data = await self._fetch_consumption(current_date)
+                        
+                        if consumption_data:
+                            await self._process_historical_consumption(consumption_data)
+                            days_fetched += 1
+                        else:
+                            _LOGGER.debug("No consumption data available for %s", current_date.date())
+                            
+                    except Exception as e:
+                        _LOGGER.warning("Failed to fetch consumption data for %s: %s", current_date.date(), e)
+                    
+                    current_date -= timedelta(days=1)
+                    
+                    # Add small delay to avoid overwhelming the API
+                    if days_fetched > 0:
+                        await asyncio.sleep(0.5)
             
             if days_fetched > 0:
                 _LOGGER.info("Successfully fetched historical consumption data for %d days", days_fetched)
