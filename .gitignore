@@ -4,3 +4,4 @@ __pycache__/
 # Keep brand assets
 !*/brand/
 !*/brand/*.png
+screenshots/

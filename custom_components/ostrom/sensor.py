@@ -398,7 +398,18 @@ class OstromDataCoordinator(DataUpdateCoordinator):
             if last_stats and statistic_id in last_stats:
                 # We have existing data - check if we have yesterday's data
                 last_stat = last_stats[statistic_id][0]
-                last_date = last_stat["start"].replace(hour=0, minute=0, second=0, microsecond=0)
+                
+                # Convert timestamp to datetime if needed
+                start_value = last_stat["start"]
+                if isinstance(start_value, (int, float)):
+                    # Convert Unix timestamp to datetime
+                    last_date = datetime.fromtimestamp(start_value, tz=ZoneInfo("UTC"))
+                else:
+                    # Already a datetime object
+                    last_date = start_value
+                    if last_date.tzinfo is None:
+                        last_date = last_date.replace(tzinfo=ZoneInfo("UTC"))
+                
                 last_date_utc = last_date.astimezone(ZoneInfo("UTC")).replace(hour=0, minute=0, second=0, microsecond=0)
                 
                 _LOGGER.info("Found existing data until %s", last_date_utc.date())
