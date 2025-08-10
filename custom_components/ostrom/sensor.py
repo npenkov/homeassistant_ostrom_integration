@@ -22,6 +22,7 @@ from homeassistant.util import dt
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
 from homeassistant.components.recorder.statistics import async_import_statistics
+from homeassistant.components.recorder.statistics import async_add_external_statistics
 from homeassistant.components.recorder.statistics import get_last_statistics
 from homeassistant.components.recorder.statistics import statistics_during_period
 
@@ -277,7 +278,7 @@ class OstromDataCoordinator(DataUpdateCoordinator):
 
     async def _fetch_prices(self):
         """Fetch price data including future prices."""
-        now = datetime.now(ZoneInfo("UTC")).replace(minute=0, second=0, microsecond=0)
+        now = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
         url = f"https://{self._env_prefix}/spot-prices"
 
         headers = {"Authorization": f"Bearer {self._access_token}"}
@@ -413,13 +414,13 @@ class OstromDataCoordinator(DataUpdateCoordinator):
                 has_mean=True,
                 has_sum=False,
                 name="Ostrom Hourly Energy Consumption",
-                source="ostrom",
+                source=DOMAIN,
                 statistic_id=statistic_id,
                 unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
             )
 
             try:
-                async_import_statistics(self.hass, metadata, statistics)
+                async_add_external_statistics(self.hass, metadata, statistics)
                 _LOGGER.warning(
                     "Added %d hourly consumption statistics", len(statistics)
                 )
@@ -480,17 +481,17 @@ class OstromDataCoordinator(DataUpdateCoordinator):
             now = datetime.now(ZoneInfo("UTC"))
             target_time = now - timedelta(hours=24)
             target_time = target_time.replace(minute=0, second=0, microsecond=0)
-            
+
             # Convert to local timezone for statistics query
             local_target_time = target_time.astimezone(self.local_tz)
-            
+
             # Query statistics for that specific hour
-            statistic_id = "sensor.ostrom_hourly_consumption_energy"
-            
+            statistic_id = f"${DOMAIN}:ostrom_hourly_consumption_energy"
+
             # Get statistics for the target hour (1 hour period)
             start_time = local_target_time
             end_time = start_time + timedelta(hours=1)
-            
+
             recorder = get_instance(self.hass)
             statistics = await recorder.async_add_executor_job(
                 statistics_during_period,
@@ -500,24 +501,23 @@ class OstromDataCoordinator(DataUpdateCoordinator):
                 [statistic_id],
                 "hour",
                 None,
-                {"mean"}
+                {"mean"},
             )
-            
+
             if statistics and statistic_id in statistics:
                 stats_data = statistics[statistic_id]
                 if stats_data and len(stats_data) > 0:
                     # Get the mean value (kWh consumption for that hour)
                     latest_stat = stats_data[-1]
-                    return {
-                        'timestamp': target_time,
-                        'kwh': latest_stat.get("mean", 0)
-                    }
-            
+                    return {"timestamp": target_time, "kwh": latest_stat.get("mean", 0)}
+
             _LOGGER.debug("No historical usage data found for 24h ago")
             return None
-            
+
         except Exception as e:
-            _LOGGER.warning("Failed to fetch historical usage data from statistics: %s", e)
+            _LOGGER.warning(
+                "Failed to fetch historical usage data from statistics: %s", e
+            )
             return None
 
     async def _fetch_historical_data_if_needed(self):
@@ -529,7 +529,7 @@ class OstromDataCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("Fetching historical data for %s", self.contract_id)
 
             # Check if we have any statistics for this sensor
-            statistic_id = f"sensor.ostrom_hourly_consumption_energy"
+            statistic_id = f"${DOMAIN}:ostrom_hourly_consumption_energy"
 
             # Get the last recorded statistic to see what data we already have
             recorder = get_instance(self.hass)
@@ -936,15 +936,21 @@ class OstromHistoricalUsageSensor(CoordinatorEntity, SensorEntity):
     @property
     def native_value(self) -> Optional[float]:
         """Return the energy usage from 24 hours ago."""
-        if not self.coordinator.data or not hasattr(self.coordinator.data, 'historical_usage_data'):
+        if not self.coordinator.data or not hasattr(
+            self.coordinator.data, "historical_usage_data"
+        ):
             return None
-        
+
         historical_data = self.coordinator.data.historical_usage_data
         if not historical_data:
             return None
-            
-        self._last_data_timestamp = historical_data.get('timestamp')
-        return round(historical_data.get('kwh', 0), 3) if historical_data.get('kwh') else None
+
+        self._last_data_timestamp = historical_data.get("timestamp")
+        return (
+            round(historical_data.get("kwh", 0), 3)
+            if historical_data.get("kwh")
+            else None
+        )
 
     @property
     def extra_state_attributes(self) -> Dict[str, Any]:
@@ -956,5 +962,5 @@ class OstromHistoricalUsageSensor(CoordinatorEntity, SensorEntity):
                 if self._last_data_timestamp
                 else None
             ),
-            "note": "Data is 24 hours behind real-time"
+            "note": "Data is 24 hours behind real-time",
         }
