@@ -23,6 +23,7 @@ from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
 from homeassistant.components.recorder.statistics import async_import_statistics
 from homeassistant.components.recorder.statistics import get_last_statistics
+from homeassistant.components.recorder.statistics import statistics_during_period
 
 from . import DOMAIN
 from .auth import get_access_token
@@ -412,7 +413,7 @@ class OstromDataCoordinator(DataUpdateCoordinator):
                 has_mean=True,
                 has_sum=False,
                 name="Ostrom Hourly Energy Consumption",
-                source=DOMAIN,
+                source="ostrom",
                 statistic_id=statistic_id,
                 unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
             )
@@ -473,78 +474,50 @@ class OstromDataCoordinator(DataUpdateCoordinator):
         return total_hours_fetched
 
     async def _fetch_historical_usage_data(self):
-        """Fetch historical usage data (24h delayed) for the historical usage sensor."""
-        if not self.contract_id:
-            return None
-
+        """Fetch historical usage data (24h delayed) from statistics database."""
         try:
-            # Calculate time range for 24 hours ago (get last 24 hours of data, ending 24h ago)
+            # Calculate the timestamp 24 hours ago
             now = datetime.now(ZoneInfo("UTC"))
-            end_time_24h_ago = now - timedelta(hours=24)
-            start_time_24h_ago = end_time_24h_ago - timedelta(
-                hours=24
-            )  # 24 hours of data
-
-            # Round to hour boundaries
-            end_time_24h_ago = end_time_24h_ago.replace(
-                minute=0, second=0, microsecond=0
+            target_time = now - timedelta(hours=24)
+            target_time = target_time.replace(minute=0, second=0, microsecond=0)
+            
+            # Convert to local timezone for statistics query
+            local_target_time = target_time.astimezone(self.local_tz)
+            
+            # Query statistics for that specific hour
+            statistic_id = "sensor.ostrom_hourly_consumption_energy"
+            
+            # Get statistics for the target hour (1 hour period)
+            start_time = local_target_time
+            end_time = start_time + timedelta(hours=1)
+            
+            recorder = get_instance(self.hass)
+            statistics = await recorder.async_add_executor_job(
+                statistics_during_period,
+                self.hass,
+                start_time,
+                end_time,
+                [statistic_id],
+                "hour",
+                None,
+                {"mean"}
             )
-            start_time_24h_ago = start_time_24h_ago.replace(
-                minute=0, second=0, microsecond=0
-            )
-
-            _LOGGER.warning(
-                "Fetching historical usage data from %s to %s",
-                start_time_24h_ago,
-                end_time_24h_ago,
-            )
-
-            # Fetch consumption data for the 24h period ending 24h ago
-            consumption_data = await self._fetch_consumption(
-                start_time_24h_ago, end_time_24h_ago
-            )
-
-            if not consumption_data or not consumption_data.get("data"):
-                _LOGGER.warning("No historical usage data available")
-                return None
-
-            # Process the data into the format expected by the sensor
-            historical_usage = []
-            for entry in consumption_data["data"]:
-                if (
-                    not isinstance(entry, dict)
-                    or "date" not in entry
-                    or "kWh" not in entry
-                ):
-                    continue
-
-                try:
-                    # Parse timestamp
-                    date_str = entry["date"]
-                    if date_str.endswith("Z"):
-                        date_str = date_str[:-1] + "+00:00"
-                    timestamp = datetime.fromisoformat(date_str)
-                    if timestamp.tzinfo is None:
-                        timestamp = timestamp.replace(tzinfo=ZoneInfo("UTC"))
-
-                    historical_usage.append(
-                        {"timestamp": timestamp, "kwh": entry["kWh"]}
-                    )
-
-                except Exception as e:
-                    _LOGGER.warning("Error processing historical usage entry: %s", e)
-
-            # Sort by timestamp (oldest first)
-            historical_usage.sort(key=lambda x: x["timestamp"])
-
-            _LOGGER.warning(
-                "Successfully fetched %d hours of historical usage data",
-                len(historical_usage),
-            )
-            return historical_usage
-
+            
+            if statistics and statistic_id in statistics:
+                stats_data = statistics[statistic_id]
+                if stats_data and len(stats_data) > 0:
+                    # Get the mean value (kWh consumption for that hour)
+                    latest_stat = stats_data[-1]
+                    return {
+                        'timestamp': target_time,
+                        'kwh': latest_stat.get("mean", 0)
+                    }
+            
+            _LOGGER.debug("No historical usage data found for 24h ago")
+            return None
+            
         except Exception as e:
-            _LOGGER.warning("Failed to fetch historical usage data: %s", e)
+            _LOGGER.warning("Failed to fetch historical usage data from statistics: %s", e)
             return None
 
     async def _fetch_historical_data_if_needed(self):
@@ -559,7 +532,8 @@ class OstromDataCoordinator(DataUpdateCoordinator):
             statistic_id = f"sensor.ostrom_hourly_consumption_energy"
 
             # Get the last recorded statistic to see what data we already have
-            last_stats = await self.hass.async_add_executor_job(
+            recorder = get_instance(self.hass)
+            last_stats = await recorder.async_add_executor_job(
                 get_last_statistics, self.hass, 1, statistic_id, True, set()
             )
 
@@ -962,57 +936,25 @@ class OstromHistoricalUsageSensor(CoordinatorEntity, SensorEntity):
     @property
     def native_value(self) -> Optional[float]:
         """Return the energy usage from 24 hours ago."""
-        if not self.coordinator.data or not hasattr(
-            self.coordinator.data, "historical_usage_data"
-        ):
+        if not self.coordinator.data or not hasattr(self.coordinator.data, 'historical_usage_data'):
             return None
-
+        
         historical_data = self.coordinator.data.historical_usage_data
         if not historical_data:
             return None
-
-        # Get the most recent entry (which should be 24h ago)
-        if isinstance(historical_data, list) and len(historical_data) > 0:
-            latest_entry = historical_data[-1]  # Most recent entry
-            self._last_data_timestamp = latest_entry.get("timestamp")
-            return round(latest_entry.get("kwh", 0), 3)
-
-        return None
+            
+        self._last_data_timestamp = historical_data.get('timestamp')
+        return round(historical_data.get('kwh', 0), 3) if historical_data.get('kwh') else None
 
     @property
     def extra_state_attributes(self) -> Dict[str, Any]:
         """Return additional state attributes."""
-        attributes = {
+        return {
             "data_delay_hours": 24,
             "last_updated": (
                 self._last_data_timestamp.isoformat()
                 if self._last_data_timestamp
                 else None
             ),
-            "note": "Data is 24 hours behind real-time",
+            "note": "Data is 24 hours behind real-time"
         }
-
-        # Add historical data if available
-        if (
-            self.coordinator.data
-            and hasattr(self.coordinator.data, "historical_usage_data")
-            and self.coordinator.data.historical_usage_data
-        ):
-
-            historical_data = self.coordinator.data.historical_usage_data
-            if isinstance(historical_data, list):
-                # Add last 24 hours of data to attributes
-                historical_hours = {}
-                for entry in historical_data:
-                    if "timestamp" in entry and "kwh" in entry:
-                        timestamp = entry["timestamp"]
-                        if isinstance(timestamp, datetime):
-                            # Convert to local time for display
-                            local_time = timestamp.astimezone(self.coordinator.local_tz)
-                            historical_hours[local_time.isoformat()] = round(
-                                entry["kwh"], 3
-                            )
-
-                attributes["historical_hours"] = historical_hours
-
-        return attributes
