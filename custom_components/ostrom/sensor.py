@@ -22,6 +22,7 @@ from homeassistant.util import dt
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
 from homeassistant.components.recorder.statistics import async_add_external_statistics
+from homeassistant.components.recorder.statistics import get_last_statistics
 
 from . import DOMAIN
 from .auth import get_access_token
@@ -44,7 +45,7 @@ class PowerPriceData:
         self.lowest_price_time = None
         self.highest_price_time = None
         self.local_tz = local_tz
-        self.consumption_data = None  # Store consumption data
+        self.historical_usage_data = None  # List of historical usage data (24h delayed)
 
     def add_entry(self, timestamp: datetime, price: float) -> None:
         """Add a price entry and update statistics."""
@@ -117,7 +118,7 @@ async def async_setup_entry(
         OstromNextPriceSensor(coordinator, entry),
         OstromLowestPriceTimeSensor(coordinator, entry),
         OstromHighestPriceTimeSensor(coordinator, entry),
-        OstromConsumptionSensor(coordinator, entry),
+        OstromHistoricalUsageSensor(coordinator, entry),
     ]
 
     # Add entities before the first refresh
@@ -209,17 +210,23 @@ class OstromDataCoordinator(DataUpdateCoordinator):
                     self.hass.async_create_task(self._fetch_historical_data_if_needed())
 
                     consumption_data = await self._fetch_consumption()
-                    processed_data.consumption_data = consumption_data
 
                     # Process current day's consumption data
                     if consumption_data:
                         await self._store_usage_to_stats(consumption_data)
 
+                    # Fetch historical usage data (24h delayed) for the sensor
+                    processed_data.historical_usage_data = (
+                        await self._fetch_historical_usage_data()
+                    )
+
                 except Exception as err:
                     _LOGGER.warning("Failed to fetch consumption data: %s", err)
                     processed_data.consumption_data = None
+                    processed_data.historical_usage_data = None
             else:
                 processed_data.consumption_data = None
+                processed_data.historical_usage_data = None
 
             _LOGGER.debug("Successfully updated Ostrom price data")
             return processed_data
@@ -306,33 +313,44 @@ class OstromDataCoordinator(DataUpdateCoordinator):
 
                 return None
 
-    async def _fetch_consumption(self, target_date=None):
-        """Fetch energy consumption data for a specific date (defaults to yesterday)."""
+    def _calculate_end_time(self, delta_hours: int = 24) -> datetime:
+        """Calculate end time based on current time minus delta hours, rounded to hour."""
+        now = datetime.now(ZoneInfo("UTC"))
+        end_time = now - timedelta(hours=delta_hours)
+        return end_time.replace(minute=0, second=0, microsecond=0)
+
+    async def _fetch_consumption(self, start_datetime=None, end_datetime=None):
+        """Fetch energy consumption data for a specific time range."""
         if not self.contract_id:
             _LOGGER.warning("No contract ID available for consumption data")
             return None
 
-        # Get target date (default to yesterday)
-        if target_date is None:
-            now = datetime.now(ZoneInfo("UTC"))
-            target_date = now - timedelta(days=1)
+        # Calculate default start and end times if not provided
+        if start_datetime is None or end_datetime is None:
+            end_time = self._calculate_end_time(24)  # 24h ago from now
+            start_time = end_time - timedelta(hours=1)  # 1 hour before end_time
 
-        # Ensure target_date is a date in UTC
-        if isinstance(target_date, datetime):
-            target_date = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+            if start_datetime is None:
+                start_datetime = start_time
+            if end_datetime is None:
+                end_datetime = end_time
+
+        # Ensure both datetimes are in UTC
+        if start_datetime.tzinfo is None:
+            start_datetime = start_datetime.replace(tzinfo=ZoneInfo("UTC"))
         else:
-            target_date = datetime.combine(target_date, datetime.min.time()).replace(
-                tzinfo=ZoneInfo("UTC")
-            )
+            start_datetime = start_datetime.astimezone(ZoneInfo("UTC"))
 
-        start_date = target_date
-        end_date = start_date + timedelta(days=1)
+        if end_datetime.tzinfo is None:
+            end_datetime = end_datetime.replace(tzinfo=ZoneInfo("UTC"))
+        else:
+            end_datetime = end_datetime.astimezone(ZoneInfo("UTC"))
 
         url = f"https://{self._env_prefix}/contracts/{self.contract_id}/energy-consumption"
         headers = {"Authorization": f"Bearer {self._access_token}"}
         params = {
-            "startDate": start_date.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-            "endDate": end_date.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "startDate": start_datetime.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "endDate": end_datetime.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
             "resolution": "HOUR",
         }
 
@@ -352,7 +370,7 @@ class OstromDataCoordinator(DataUpdateCoordinator):
             return
 
         # Create statistics for hourly consumption
-        statistic_id = f"{DOMAIN}:ostrom_hourly_consumption_{self.zip_code}"
+        statistic_id = f"sensor.ostrom_hourly_consumption_energy"
 
         # Prepare statistics data - each hour is an individual measurement
         statistics = []
@@ -405,114 +423,226 @@ class OstromDataCoordinator(DataUpdateCoordinator):
             except Exception as e:
                 _LOGGER.error("Failed to add hourly statistics: %s", e)
 
+    async def _fetch_data_in_chunks(self, start_time, end_time, max_days_per_chunk):
+        """Fetch data in chunks of maximum max_days_per_chunk days."""
+        total_hours_fetched = 0
+        current_start = start_time
+
+        while current_start < end_time:
+            # Calculate chunk end time (max_days_per_chunk days after current_start or end_time, whichever is smaller)
+            chunk_end = min(
+                current_start + timedelta(days=max_days_per_chunk), end_time
+            )
+
+            try:
+                # Fetch data for this chunk
+                consumption_data = await self._fetch_consumption(
+                    current_start, chunk_end
+                )
+
+                if consumption_data and consumption_data.get("data"):
+                    # Store the fetched data
+                    await self._store_usage_to_stats(consumption_data)
+
+                    # Count hours fetched
+                    hourly_data = consumption_data["data"]
+                    total_hours_fetched += len(hourly_data)
+
+                    _LOGGER.debug(
+                        "Fetched %d hours of delta data from %s to %s",
+                        len(hourly_data),
+                        current_start,
+                        chunk_end,
+                    )
+
+                # Move to the next chunk
+                current_start = chunk_end
+
+            except Exception as e:
+                _LOGGER.warning(
+                    "Error fetching delta chunk from %s to %s: %s",
+                    current_start,
+                    chunk_end,
+                    e,
+                )
+                # Move to next chunk even if this one failed
+                current_start = chunk_end
+
+        return total_hours_fetched
+
+    async def _fetch_historical_usage_data(self):
+        """Fetch historical usage data (24h delayed) for the historical usage sensor."""
+        if not self.contract_id:
+            return None
+
+        try:
+            # Calculate time range for 24 hours ago (get last 24 hours of data, ending 24h ago)
+            now = datetime.now(ZoneInfo("UTC"))
+            end_time_24h_ago = now - timedelta(hours=24)
+            start_time_24h_ago = end_time_24h_ago - timedelta(
+                hours=24
+            )  # 24 hours of data
+
+            # Round to hour boundaries
+            end_time_24h_ago = end_time_24h_ago.replace(
+                minute=0, second=0, microsecond=0
+            )
+            start_time_24h_ago = start_time_24h_ago.replace(
+                minute=0, second=0, microsecond=0
+            )
+
+            _LOGGER.debug(
+                "Fetching historical usage data from %s to %s",
+                start_time_24h_ago,
+                end_time_24h_ago,
+            )
+
+            # Fetch consumption data for the 24h period ending 24h ago
+            consumption_data = await self._fetch_consumption(
+                start_time_24h_ago, end_time_24h_ago
+            )
+
+            if not consumption_data or not consumption_data.get("data"):
+                _LOGGER.debug("No historical usage data available")
+                return None
+
+            # Process the data into the format expected by the sensor
+            historical_usage = []
+            for entry in consumption_data["data"]:
+                if (
+                    not isinstance(entry, dict)
+                    or "date" not in entry
+                    or "kWh" not in entry
+                ):
+                    continue
+
+                try:
+                    # Parse timestamp
+                    date_str = entry["date"]
+                    if date_str.endswith("Z"):
+                        date_str = date_str[:-1] + "+00:00"
+                    timestamp = datetime.fromisoformat(date_str)
+                    if timestamp.tzinfo is None:
+                        timestamp = timestamp.replace(tzinfo=ZoneInfo("UTC"))
+
+                    historical_usage.append(
+                        {"timestamp": timestamp, "kwh": entry["kWh"]}
+                    )
+
+                except Exception as e:
+                    _LOGGER.warning("Error processing historical usage entry: %s", e)
+
+            # Sort by timestamp (oldest first)
+            historical_usage.sort(key=lambda x: x["timestamp"])
+
+            _LOGGER.debug(
+                "Successfully fetched %d hours of historical usage data",
+                len(historical_usage),
+            )
+            return historical_usage
+
+        except Exception as e:
+            _LOGGER.warning("Failed to fetch historical usage data: %s", e)
+            return None
+
     async def _fetch_historical_data_if_needed(self):
         """Check if historical data exists and fetch missing data walking backwards from yesterday."""
         if not self.contract_id:
             return
 
         try:
-            from homeassistant.components.recorder.statistics import get_last_statistics
+            _LOGGER.debug("Fetching historical data for %s", self.contract_id)
 
             # Check if we have any statistics for this sensor
-            statistic_id = f"{DOMAIN}:ostrom_hourly_consumption_{self.zip_code}"
+            statistic_id = f"sensor.ostrom_hourly_consumption_energy"
 
             # Get the last recorded statistic to see what data we already have
             last_stats = await self.hass.async_add_executor_job(
                 get_last_statistics, self.hass, 1, statistic_id, True, set()
             )
 
-            # Yesterday is our reference point (never fetch today due to API delay)
-            yesterday = datetime.now(ZoneInfo("UTC")) - timedelta(days=1)
-            yesterday = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_time = self._calculate_end_time(24)  # 24h ago from now
 
-            days_fetched = 0
+            hours_history_fetched = 0
             max_days_per_run = 5  # Fetch 5 days per run
 
-            if last_stats and statistic_id in last_stats:
-                # We have existing data - check if we have yesterday's data
-                last_stat = last_stats[statistic_id][0]
-                last_date = last_stat["start"].replace(
-                    hour=0, minute=0, second=0, microsecond=0
+            if last_stats:
+                # We have existing data - fetch delta from last recorded time to end_time
+                _LOGGER.info("Found consumption data. Fetching just delta")
+
+                # Extract the last recorded timestamp
+                last_stat_entry = list(last_stats.values())[0][
+                    0
+                ]  # First (and only) statistic entry
+                last_stat_time = last_stat_entry["start"]
+
+                # Convert to UTC for API call
+                if last_stat_time.tzinfo is None:
+                    last_stat_time = last_stat_time.replace(tzinfo=self.local_tz)
+                start_time = last_stat_time.astimezone(ZoneInfo("UTC"))
+
+                # Fetch data from last recorded time to end_time in chunks
+                hours_history_fetched += await self._fetch_data_in_chunks(
+                    start_time, end_time, max_days_per_run
                 )
-                last_date_utc = last_date.astimezone(ZoneInfo("UTC")).replace(
-                    hour=0, minute=0, second=0, microsecond=0
-                )
-
-                _LOGGER.info("Found existing data until %s", last_date_utc.date())
-
-                # Walk backwards from yesterday until we find existing data
-                current_date = yesterday
-                while current_date > last_date_utc and days_fetched < max_days_per_run:
-                    try:
-                        _LOGGER.debug(
-                            "Fetching missing consumption data for %s",
-                            current_date.date(),
-                        )
-                        consumption_data = await self._fetch_consumption(current_date)
-
-                        if consumption_data:
-                            await self._store_usage_to_stats(consumption_data)
-                            days_fetched += 1
-                        else:
-                            _LOGGER.debug(
-                                "No consumption data available for %s",
-                                current_date.date(),
-                            )
-
-                    except Exception as e:
-                        _LOGGER.warning(
-                            "Failed to fetch consumption data for %s: %s",
-                            current_date.date(),
-                            e,
-                        )
-
-                    current_date -= timedelta(days=1)
-
-                    # Add small delay to avoid overwhelming the API
-                    if days_fetched > 0:
-                        await asyncio.sleep(0.5)
 
             else:
-                # No existing data - start from yesterday and go backwards for 5 days
+                # No existing data - start from end_time and go backwards until no data found
                 _LOGGER.info(
-                    "No existing consumption data found, fetching last 5 days from yesterday"
+                    "No existing consumption data found. Fetching all history in chunks"
                 )
 
-                current_date = yesterday
-                for i in range(max_days_per_run):
-                    try:
-                        _LOGGER.debug(
-                            "Fetching historical consumption data for %s",
-                            current_date.date(),
-                        )
-                        consumption_data = await self._fetch_consumption(current_date)
+                # Start from end_time and go backwards in chunks
+                current_end = end_time
 
-                        if consumption_data:
-                            await self._store_usage_to_stats(consumption_data)
-                            days_fetched += 1
-                        else:
+                while True:
+                    # Calculate chunk start time (5 days before current_end)
+                    chunk_start = current_end - timedelta(days=max_days_per_run)
+
+                    try:
+                        # Fetch data for this chunk
+                        consumption_data = await self._fetch_consumption(
+                            chunk_start, current_end
+                        )
+
+                        if not consumption_data or not consumption_data.get("data"):
+                            # No data found, stop fetching
                             _LOGGER.debug(
-                                "No consumption data available for %s",
-                                current_date.date(),
+                                "No more historical data available, stopping at %s",
+                                current_end,
                             )
+                            break
+
+                        # Store the fetched data
+                        await self._store_usage_to_stats(consumption_data)
+
+                        # Count hours fetched
+                        hourly_data = consumption_data["data"]
+                        hours_history_fetched += len(hourly_data)
+
+                        _LOGGER.debug(
+                            "Fetched %d hours of data from %s to %s",
+                            len(hourly_data),
+                            chunk_start,
+                            current_end,
+                        )
+
+                        # Move to the next chunk (earlier time period)
+                        current_end = chunk_start
 
                     except Exception as e:
                         _LOGGER.warning(
-                            "Failed to fetch consumption data for %s: %s",
-                            current_date.date(),
+                            "Error fetching historical chunk from %s to %s: %s",
+                            chunk_start,
+                            current_end,
                             e,
                         )
+                        break
 
-                    current_date -= timedelta(days=1)
-
-                    # Add small delay to avoid overwhelming the API
-                    if days_fetched > 0:
-                        await asyncio.sleep(0.5)
-
-            if days_fetched > 0:
+            if hours_history_fetched > 0:
                 _LOGGER.info(
-                    "Successfully fetched historical consumption data for %d days",
-                    days_fetched,
+                    "Successfully fetched historical consumption data for %d hours",
+                    hours_history_fetched,
                 )
 
         except Exception as e:
@@ -812,120 +942,75 @@ class OstromHighestPriceTimeSensor(CoordinatorEntity, SensorEntity):
         }
 
 
-class OstromConsumptionSensor(CoordinatorEntity, SensorEntity):
-    """Sensor for current energy consumption."""
+class OstromHistoricalUsageSensor(CoordinatorEntity, SensorEntity):
+    """Sensor for historical energy usage (24h delayed)."""
 
     def __init__(self, coordinator, entry):
         super().__init__(coordinator)
         self._attr_has_entity_name = True
-        self._attr_translation_key = "ostrom_integration_energy_consumption"
-        self._attr_unique_id = f"ostrom_consumption_{entry.data['zip_code']}"
+        self._attr_translation_key = "ostrom_hourly_consumption_energy"
+        self._attr_unique_id = f"ostrom_hourly_consumption_energy"
         self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_device_class = SensorDeviceClass.ENERGY
         self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
-        self._attr_suggested_display_precision = 2
+        self._attr_suggested_display_precision = 3
         self._attr_device_info = coordinator.device_info
+        self._last_data_timestamp = None
 
     @property
     def native_value(self) -> Optional[float]:
-        """Return the latest hourly consumption value."""
-        if not self.coordinator.data or not self.coordinator.data.consumption_data:
+        """Return the energy usage from 24 hours ago."""
+        if not self.coordinator.data or not hasattr(
+            self.coordinator.data, "historical_usage_data"
+        ):
             return None
 
-        consumption_data = self.coordinator.data.consumption_data
-        if isinstance(consumption_data, dict) and "data" in consumption_data:
-            # Get the most recent hourly consumption
-            hourly_data = consumption_data["data"]
-            if isinstance(hourly_data, list) and len(hourly_data) > 0:
-                # Return the last entry's consumption (most recent hour)
-                last_entry = hourly_data[-1]
-                if isinstance(last_entry, dict) and "kWh" in last_entry:
-                    return round(last_entry["kWh"], 3)
+        historical_data = self.coordinator.data.historical_usage_data
+        if not historical_data:
+            return None
+
+        # Get the most recent entry (which should be 24h ago)
+        if isinstance(historical_data, list) and len(historical_data) > 0:
+            latest_entry = historical_data[-1]  # Most recent entry
+            self._last_data_timestamp = latest_entry.get("timestamp")
+            return round(latest_entry.get("kwh", 0), 3)
 
         return None
 
     @property
     def extra_state_attributes(self) -> Dict[str, Any]:
         """Return additional state attributes."""
-        if not self.coordinator.data or not self.coordinator.data.consumption_data:
-            return {}
+        attributes = {
+            "data_delay_hours": 24,
+            "last_updated": (
+                self._last_data_timestamp.isoformat()
+                if self._last_data_timestamp
+                else None
+            ),
+            "note": "Data is 24 hours behind real-time",
+        }
 
-        consumption_data = self.coordinator.data.consumption_data
-        if isinstance(consumption_data, dict) and "data" in consumption_data:
-            hourly_data = consumption_data["data"]
-            if isinstance(hourly_data, list) and len(hourly_data) > 0:
-                # Create hourly consumption breakdown
-                hourly_consumption = {}
-                total_hours = len(hourly_data)
-                min_consumption = float("inf")
-                max_consumption = 0
+        # Add historical data if available
+        if (
+            self.coordinator.data
+            and hasattr(self.coordinator.data, "historical_usage_data")
+            and self.coordinator.data.historical_usage_data
+        ):
 
-                for entry in hourly_data:
-                    if isinstance(entry, dict) and "date" in entry and "kWh" in entry:
-                        # Parse date and convert to local time
-                        try:
-                            date_str = entry["date"]
-                            if date_str.endswith("Z"):
-                                date_str = date_str[:-1] + "+00:00"
-                            timestamp = datetime.fromisoformat(date_str)
-                            if timestamp.tzinfo is None:
-                                timestamp = timestamp.replace(tzinfo=ZoneInfo("UTC"))
+            historical_data = self.coordinator.data.historical_usage_data
+            if isinstance(historical_data, list):
+                # Add last 24 hours of data to attributes
+                historical_hours = {}
+                for entry in historical_data:
+                    if "timestamp" in entry and "kwh" in entry:
+                        timestamp = entry["timestamp"]
+                        if isinstance(timestamp, datetime):
+                            # Convert to local time for display
                             local_time = timestamp.astimezone(self.coordinator.local_tz)
+                            historical_hours[local_time.isoformat()] = round(
+                                entry["kwh"], 3
+                            )
 
-                            kwh = entry["kWh"]
-                            hourly_consumption[local_time.strftime("%H:%M")] = kwh
+                attributes["historical_hours"] = historical_hours
 
-                            if kwh < min_consumption:
-                                min_consumption = kwh
-                            if kwh > max_consumption:
-                                max_consumption = kwh
-                        except Exception as e:
-                            _LOGGER.warning("Error parsing consumption entry: %s", e)
-
-                # Calculate daily total for attributes
-                daily_total = sum(
-                    entry.get("kWh", 0)
-                    for entry in hourly_data
-                    if isinstance(entry, dict)
-                )
-
-                attributes = {
-                    "hourly_consumption": hourly_consumption,
-                    "total_hours": total_hours,
-                    "daily_total": round(daily_total, 3),
-                    "min_hourly_consumption": (
-                        min_consumption if min_consumption != float("inf") else None
-                    ),
-                    "max_hourly_consumption": (
-                        max_consumption if max_consumption > 0 else None
-                    ),
-                    "average_hourly_consumption": (
-                        round(daily_total / total_hours, 3)
-                        if daily_total and total_hours > 0
-                        else None
-                    ),
-                    "data_date": (
-                        hourly_data[0].get("date", "").split("T")[0]
-                        if hourly_data
-                        else None
-                    ),
-                    "latest_hour": (
-                        hourly_data[-1].get("date", "").split("T")[1][:5]
-                        if hourly_data
-                        else None
-                    ),
-                }
-
-                return attributes
-
-        return {}
-
-    @property
-    def available(self) -> bool:
-        """Return True if entity is available."""
-        return (
-            self.coordinator.last_update_success
-            and self.coordinator.data is not None
-            and hasattr(self.coordinator, "contract_id")
-            and self.coordinator.contract_id is not None
-        )
+        return attributes
