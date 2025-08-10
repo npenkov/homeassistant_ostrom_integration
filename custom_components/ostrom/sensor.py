@@ -21,7 +21,7 @@ from homeassistant.const import CURRENCY_EURO, UnitOfEnergy
 from homeassistant.util import dt
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
-from homeassistant.components.recorder.statistics import async_add_external_statistics
+from homeassistant.components.recorder.statistics import async_import_statistics
 from homeassistant.components.recorder.statistics import get_last_statistics
 
 from . import DOMAIN
@@ -175,7 +175,7 @@ class OstromDataCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self) -> PowerPriceData:
         """Fetch and process price data with proper error handling."""
         try:
-            _LOGGER.debug("Starting data update for Ostrom integration")
+            _LOGGER.warning("Starting data update for Ostrom integration")
 
             # After each update, set the update interval to 1 hour
             self.update_interval = timedelta(hours=1)
@@ -228,7 +228,7 @@ class OstromDataCoordinator(DataUpdateCoordinator):
                 processed_data.consumption_data = None
                 processed_data.historical_usage_data = None
 
-            _LOGGER.debug("Successfully updated Ostrom price data")
+            _LOGGER.warning("Successfully updated Ostrom price data")
             return processed_data
         except Exception as err:
             _LOGGER.error("Error updating Ostrom price data: %s", err, exc_info=True)
@@ -418,8 +418,10 @@ class OstromDataCoordinator(DataUpdateCoordinator):
             )
 
             try:
-                async_add_external_statistics(self.hass, metadata, statistics)
-                _LOGGER.debug("Added %d hourly consumption statistics", len(statistics))
+                async_import_statistics(self.hass, metadata, statistics)
+                _LOGGER.warning(
+                    "Added %d hourly consumption statistics", len(statistics)
+                )
             except Exception as e:
                 _LOGGER.error("Failed to add hourly statistics: %s", e)
 
@@ -448,7 +450,7 @@ class OstromDataCoordinator(DataUpdateCoordinator):
                     hourly_data = consumption_data["data"]
                     total_hours_fetched += len(hourly_data)
 
-                    _LOGGER.debug(
+                    _LOGGER.warning(
                         "Fetched %d hours of delta data from %s to %s",
                         len(hourly_data),
                         current_start,
@@ -491,7 +493,7 @@ class OstromDataCoordinator(DataUpdateCoordinator):
                 minute=0, second=0, microsecond=0
             )
 
-            _LOGGER.debug(
+            _LOGGER.warning(
                 "Fetching historical usage data from %s to %s",
                 start_time_24h_ago,
                 end_time_24h_ago,
@@ -503,7 +505,7 @@ class OstromDataCoordinator(DataUpdateCoordinator):
             )
 
             if not consumption_data or not consumption_data.get("data"):
-                _LOGGER.debug("No historical usage data available")
+                _LOGGER.warning("No historical usage data available")
                 return None
 
             # Process the data into the format expected by the sensor
@@ -535,7 +537,7 @@ class OstromDataCoordinator(DataUpdateCoordinator):
             # Sort by timestamp (oldest first)
             historical_usage.sort(key=lambda x: x["timestamp"])
 
-            _LOGGER.debug(
+            _LOGGER.warning(
                 "Successfully fetched %d hours of historical usage data",
                 len(historical_usage),
             )
@@ -551,7 +553,7 @@ class OstromDataCoordinator(DataUpdateCoordinator):
             return
 
         try:
-            _LOGGER.debug("Fetching historical data for %s", self.contract_id)
+            _LOGGER.warning("Fetching historical data for %s", self.contract_id)
 
             # Check if we have any statistics for this sensor
             statistic_id = f"sensor.ostrom_hourly_consumption_energy"
@@ -607,7 +609,7 @@ class OstromDataCoordinator(DataUpdateCoordinator):
 
                         if not consumption_data or not consumption_data.get("data"):
                             # No data found, stop fetching
-                            _LOGGER.debug(
+                            _LOGGER.warning(
                                 "No more historical data available, stopping at %s",
                                 current_end,
                             )
@@ -620,7 +622,7 @@ class OstromDataCoordinator(DataUpdateCoordinator):
                         hourly_data = consumption_data["data"]
                         hours_history_fetched += len(hourly_data)
 
-                        _LOGGER.debug(
+                        _LOGGER.warning(
                             "Fetched %d hours of data from %s to %s",
                             len(hourly_data),
                             chunk_start,
@@ -950,7 +952,7 @@ class OstromHistoricalUsageSensor(CoordinatorEntity, SensorEntity):
         self._attr_has_entity_name = True
         self._attr_translation_key = "ostrom_hourly_consumption_energy"
         self._attr_unique_id = f"ostrom_hourly_consumption_energy"
-        self._attr_state_class = SensorStateClass.MEASUREMENT
+        self._attr_state_class = SensorStateClass.TOTAL
         self._attr_device_class = SensorDeviceClass.ENERGY
         self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
         self._attr_suggested_display_precision = 3
